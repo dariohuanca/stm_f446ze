@@ -23,6 +23,12 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 
+#include <stdio.h>
+#include <string.h>
+#include <stdarg.h>
+#include <stdbool.h>
+
+
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -32,6 +38,24 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+
+/* ---- CONFIGURE THIS ---- */
+#define LINK_UART_HANDLE  huart7          // <--- change to your UART handle (huart3, huart7, etc.)
+#define SEND_FILENAME     "inten.txt"     // file on the SD card to send
+/* ------------------------ */
+
+#define CHUNK          1024u              // multiple of 512 recommended
+#define SOF0           0x55
+#define SOF1           0xAA
+#define ACK            0x06
+#define NAK            0x15
+#define UART_TMO_MS    500
+#define MAX_RETRY      8
+
+extern UART_HandleTypeDef LINK_UART_HANDLE;
+
+
+void myprintf(const char *fmt, ...);
 
 /* USER CODE END PD */
 
@@ -50,6 +74,144 @@ UART_HandleTypeDef huart3;
 PCD_HandleTypeDef hpcd_USB_OTG_FS;
 
 /* USER CODE BEGIN PV */
+
+void myprintf(const char *fmt, ...) {
+  static char buffer[256];
+  va_list args;
+  va_start(args, fmt);
+  vsnprintf(buffer, sizeof(buffer), fmt, args);
+  va_end(args);
+
+  int len = strlen(buffer);
+  HAL_UART_Transmit(&huart4, (uint8_t*)buffer, len, -1);
+
+}
+
+
+/* ===== CRC16-CCITT (poly 0x1021, init 0xFFFF) ===== */
+static uint16_t crc16_ccitt(const uint8_t *data, uint32_t len)
+{
+    uint16_t crc = 0xFFFF;
+    for (uint32_t i = 0; i < len; i++) {
+        crc ^= ((uint16_t)data[i]) << 8;
+        for (uint8_t b = 0; b < 8; b++) {
+            crc = (crc & 0x8000) ? (uint16_t)((crc << 1) ^ 0x1021) : (uint16_t)(crc << 1);
+        }
+    }
+    return crc;
+}
+
+/* ===== UART helpers (blocking) ===== */
+static int uart_send(const void *p, uint16_t n)
+{
+    return (HAL_UART_Transmit(&LINK_UART_HANDLE, (uint8_t*)p, n, HAL_MAX_DELAY) == HAL_OK) ? 0 : -1;
+}
+static int uart_recv(void *p, uint16_t n, uint32_t tmo)
+{
+    return (HAL_UART_Receive(&LINK_UART_HANDLE, (uint8_t*)p, n, tmo) == HAL_OK) ? 0 : -1;
+}
+
+/* ===== Protocol: header + framed data ===== */
+static int send_header(uint32_t fsz)
+{
+    uint8_t hdr[6] = { 'S','Z', (uint8_t)(fsz), (uint8_t)(fsz>>8), (uint8_t)(fsz>>16), (uint8_t)(fsz>>24) };
+    if (uart_send(hdr, sizeof(hdr)) != 0) return -1;
+
+    uint8_t ack = 0;
+    if (uart_recv(&ack, 1, UART_TMO_MS) != 0) return -2;
+    return (ack == ACK) ? 0 : -3;
+}
+
+static int send_frame(uint16_t seq, const uint8_t *data, uint16_t len)
+{
+    static uint8_t tx[CHUNK + 8]; // SOF(2) + seq(2) + len(2) + payload + crc(2)
+    tx[0] = SOF0; tx[1] = SOF1;
+    tx[2] = (uint8_t)(seq); tx[3] = (uint8_t)(seq >> 8);
+    tx[4] = (uint8_t)(len); tx[5] = (uint8_t)(len >> 8);
+    memcpy(&tx[6], data, len);
+    uint16_t crc = crc16_ccitt(data, len);
+    tx[6 + len]     = (uint8_t)(crc);
+    tx[6 + len + 1] = (uint8_t)(crc >> 8);
+
+    for (int attempt = 0; attempt < MAX_RETRY; attempt++) {
+        if (uart_send(tx, (uint16_t)(len + 8)) != 0) return -10;
+
+        uint8_t resp[3];
+        if (uart_recv(resp, 3, UART_TMO_MS) == 0 && resp[0] == ACK) {
+            uint16_t seq_echo = (uint16_t)resp[1] | ((uint16_t)resp[2] << 8);
+            if (seq_echo == seq) return 0;
+        }
+        // retry on timeout or NAK
+    }
+    return -11;
+}
+
+/* ===== Public API: send a file ===== */
+int send_file_over_uart(const char *path)
+{
+    FRESULT fr;
+    FATFS fs;
+    FIL   f;
+    UINT  br;
+    static uint8_t buf[CHUNK];
+
+    // Ensure FatFs is wired to SPI SD in your project
+    MX_FATFS_Init();
+    fr = f_mount(&fs, "", 1);
+    if (fr != FR_OK) return -100;
+
+    fr = f_open(&f, path, FA_READ | FA_OPEN_EXISTING);
+    if (fr != FR_OK) { f_mount(NULL, "", 0); return -101; }
+
+    uint32_t fsz = (uint32_t)f_size(&f);
+    if (send_header(fsz) != 0) { f_close(&f); f_mount(NULL, "", 0); return -102; }
+
+    uint16_t seq = 0;
+    uint32_t sent = 0;
+
+    while (sent < fsz) {
+        UINT need = (fsz - sent > CHUNK) ? CHUNK : (UINT)(fsz - sent);
+        fr = f_read(&f, buf, need, &br);
+        if (fr != FR_OK) { f_close(&f); f_mount(NULL, "", 0); return -103; }
+        if (br == 0) break;
+
+        if (send_frame(seq, buf, (uint16_t)br) != 0) { f_close(&f); f_mount(NULL, "", 0); return -104; }
+        sent += br;
+        seq++;
+    }
+
+    f_close(&f);
+    f_mount(NULL, "", 0);
+    return 0;
+}
+
+/* ===== Button-driven send (polling) =====
+ * Requires USER button as input (e.g., Nucleo B1 on PC13).
+ */
+static volatile bool g_sending  = false;
+static bool btn_prev = true; // idle-high on many Nucleo boards
+
+static bool button_pressed_edge(void)
+{
+    bool now = (HAL_GPIO_ReadPin(USER_Btn_GPIO_Port, USER_Btn_Pin) == GPIO_PIN_SET);
+    bool pressed = (btn_prev && !now); // high -> low
+    btn_prev = now;
+    return pressed;
+}
+
+void user_loop_sender(void)
+{
+    if (!g_sending && button_pressed_edge()) {
+        g_sending = true;
+        (void)send_file_over_uart(SEND_FILENAME);
+        g_sending = false;
+    }
+}
+/* ================== END F446ZE SENDER ================== */
+
+
+
+
 
 /* USER CODE END PV */
 
@@ -105,6 +267,45 @@ int main(void)
   MX_FATFS_Init();
   MX_UART4_Init();
   /* USER CODE BEGIN 2 */
+
+  myprintf("\r\n~ SD card demo by kiwih ~\r\n\r\n");
+
+  HAL_Delay(2000); //a short delay is important to let the SD card settle
+
+  //some variables for FatFs
+  FATFS FatFs; 	//Fatfs handle
+  FIL fil; 		//File handle
+  FRESULT fres; //Result after operations
+
+  //Open the file system
+  fres = f_mount(&FatFs, "", 1); //1=mount now
+  if (fres != FR_OK) {
+	myprintf("f_mount error (%i)\r\n", fres);
+	while(1);
+  }
+
+  //Let's get some statistics from the SD card
+  DWORD free_clusters, free_sectors, total_sectors;
+
+  FATFS* getFreeFs;
+
+  fres = f_getfree("", &free_clusters, &getFreeFs);
+  if (fres != FR_OK) {
+	myprintf("f_getfree error (%i)\r\n", fres);
+	while(1);
+  }
+
+  //Formula comes from ChaN's documentation
+  total_sectors = (getFreeFs->n_fatent - 2) * getFreeFs->csize;
+  free_sectors = free_clusters * getFreeFs->csize;
+
+  myprintf("SD card stats:\r\n%10lu KiB total drive space.\r\n%10lu KiB available.\r\n", total_sectors / 2, free_sectors / 2);
+  HAL_Delay(1000);
+
+
+
+
+
 
   /* USER CODE END 2 */
 
@@ -219,7 +420,7 @@ static void MX_UART4_Init(void)
 
   /* USER CODE END UART4_Init 1 */
   huart4.Instance = UART4;
-  huart4.Init.BaudRate = 115200;
+  huart4.Init.BaudRate = 1200;
   huart4.Init.WordLength = UART_WORDLENGTH_8B;
   huart4.Init.StopBits = UART_STOPBITS_1;
   huart4.Init.Parity = UART_PARITY_NONE;
@@ -252,7 +453,7 @@ static void MX_UART5_Init(void)
 
   /* USER CODE END UART5_Init 1 */
   huart5.Instance = UART5;
-  huart5.Init.BaudRate = 115200;
+  huart5.Init.BaudRate = 1200;
   huart5.Init.WordLength = UART_WORDLENGTH_8B;
   huart5.Init.StopBits = UART_STOPBITS_1;
   huart5.Init.Parity = UART_PARITY_NONE;
@@ -367,6 +568,9 @@ static void MX_GPIO_Init(void)
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(USB_PowerSwitchOn_GPIO_Port, USB_PowerSwitchOn_Pin, GPIO_PIN_RESET);
 
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(SPI1_CSD7_GPIO_Port, SPI1_CSD7_Pin, GPIO_PIN_RESET);
+
   /*Configure GPIO pin : USER_Btn_Pin */
   GPIO_InitStruct.Pin = USER_Btn_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
@@ -399,6 +603,13 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(USB_OverCurrent_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : SPI1_CSD7_Pin */
+  GPIO_InitStruct.Pin = SPI1_CSD7_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(SPI1_CSD7_GPIO_Port, &GPIO_InitStruct);
 
 /* USER CODE BEGIN MX_GPIO_Init_2 */
 /* USER CODE END MX_GPIO_Init_2 */

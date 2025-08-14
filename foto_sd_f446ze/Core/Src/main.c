@@ -40,8 +40,8 @@
 /* USER CODE BEGIN PD */
 
 /* ---- CONFIGURE THIS ---- */
-#define LINK_UART_HANDLE  huart7          // <--- change to your UART handle (huart3, huart7, etc.)
-#define SEND_FILENAME     "inten.txt"     // file on the SD card to send
+#define LINK_UART_HANDLE  huart5          // <--- change to your UART handle (huart3, huart7, etc.)
+#define SEND_FILENAME     "words_1500.txt"     // file on the SD card to send
 /* ------------------------ */
 
 #define CHUNK          1024u              // multiple of 512 recommended
@@ -124,6 +124,7 @@ static int send_header(uint32_t fsz)
 
 static int send_frame(uint16_t seq, const uint8_t *data, uint16_t len)
 {
+	myprintf("Enviando x4 \r\n");
     static uint8_t tx[CHUNK + 8]; // SOF(2) + seq(2) + len(2) + payload + crc(2)
     tx[0] = SOF0; tx[1] = SOF1;
     tx[2] = (uint8_t)(seq); tx[3] = (uint8_t)(seq >> 8);
@@ -159,6 +160,7 @@ int send_file_over_uart(const char *path)
     MX_FATFS_Init();
     fr = f_mount(&fs, "", 1);
     if (fr != FR_OK) return -100;
+    myprintf("Enviando x2 \r\n");
 
     fr = f_open(&f, path, FA_READ | FA_OPEN_EXISTING);
     if (fr != FR_OK) { f_mount(NULL, "", 0); return -101; }
@@ -170,6 +172,8 @@ int send_file_over_uart(const char *path)
     uint32_t sent = 0;
 
     while (sent < fsz) {
+    	myprintf("Enviando x3 \r\n");
+
         UINT need = (fsz - sent > CHUNK) ? CHUNK : (UINT)(fsz - sent);
         fr = f_read(&f, buf, need, &br);
         if (fr != FR_OK) { f_close(&f); f_mount(NULL, "", 0); return -103; }
@@ -193,7 +197,7 @@ static bool btn_prev = true; // idle-high on many Nucleo boards
 
 static bool button_pressed_edge(void)
 {
-    bool now = (HAL_GPIO_ReadPin(USER_Btn_GPIO_Port, USER_Btn_Pin) == GPIO_PIN_SET);
+    bool now = (HAL_GPIO_ReadPin(USER_Btn_GPIO_Port, USER_Btn_Pin) == GPIO_PIN_RESET);
     bool pressed = (btn_prev && !now); // high -> low
     btn_prev = now;
     return pressed;
@@ -202,6 +206,7 @@ static bool button_pressed_edge(void)
 void user_loop_sender(void)
 {
     if (!g_sending && button_pressed_edge()) {
+    	myprintf("Enviando \r\n");
         g_sending = true;
         (void)send_file_over_uart(SEND_FILENAME);
         g_sending = false;
@@ -314,7 +319,7 @@ int main(void)
   while (1)
   {
     /* USER CODE END WHILE */
-
+	  user_loop_sender();
     /* USER CODE BEGIN 3 */
   }
   /* USER CODE END 3 */

@@ -41,10 +41,10 @@
 
 /* ---- CONFIGURE THIS ---- */
 #define LINK_UART_HANDLE  huart5          // <--- change to your UART handle (huart3, huart7, etc.)
-#define SEND_FILENAME     "words_1500.txt"     // file on the SD card to send
+#define SEND_FILENAME     "words_35.txt"     // file on the SD card to send
 /* ------------------------ */
 
-#define CHUNK          1024u              // multiple of 512 recommended
+#define CHUNK          16u              // multiple of 512 recommended
 #define SOF0           0x55
 #define SOF1           0xAA
 #define ACK            0x06
@@ -70,6 +70,7 @@ SPI_HandleTypeDef hspi1;
 UART_HandleTypeDef huart4;
 UART_HandleTypeDef huart5;
 UART_HandleTypeDef huart3;
+
 
 PCD_HandleTypeDef hpcd_USB_OTG_FS;
 
